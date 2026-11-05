@@ -1,6 +1,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
 
 /* Maximum input length is 1023 characters plus the null terminator. */
 #define INPUT_SIZE 1024
@@ -31,6 +35,45 @@ static int parse_command(char *input, char *argv[], size_t capacity)
     /* Required by execvp when we add execution next. */
     argv[count] = NULL;
     return (int)count;
+}
+
+/*
+ * Run one external command.
+ * The child executes the program; the parent waits and stays alive.
+ */
+static void execute_command(char *argv[])
+{
+    pid_t pid = fork();
+
+    if (pid == -1) {
+        perror("fork");
+        return;
+    }
+
+    if (pid == 0) {
+        /* Search PATH and replace this child with the requested program. */
+        execvp(argv[0], argv);
+
+        /* Successful execvp never returns. */
+        int saved_errno = errno;
+        perror(argv[0]);
+
+        /* Avoid flushing copies of the parent's stdio buffers. */
+        _exit(saved_errno == ENOENT ? 127 : 126);
+    }
+
+    /* Reap this specific child to prevent a zombie process. */
+    int status;
+
+    while (waitpid(pid, &status, 0) == -1) {
+        /* Retry if a signal interrupted the wait. */
+        if (errno == EINTR) {
+            continue;
+        }
+
+        perror("waitpid");
+        return;
+    }
 }
 
 int main(void)
@@ -110,9 +153,9 @@ int main(void)
 	    continue;
 	}
 
-	/* Temporary output: verify parsing before executing commands. */
-	for (int i = 0; i < argc; i++) {
-	    printf("argv[%d] = \"%s\"\n", i, argv[i]);
+	/* Execute only when parsing produced a command. */
+	if (argc > 0) {
+		execute_command(argv);
 	}
     }
 
