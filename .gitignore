@@ -1,0 +1,5 @@
+# Compiled executable
+/remoteshell
+
+# Compiled object files
+*.o
