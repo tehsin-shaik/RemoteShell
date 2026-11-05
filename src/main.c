@@ -76,6 +76,53 @@ static void execute_command(char *argv[])
     }
 }
 
+/*
+ * Handle built-ins in the shell process.
+ * Return 1 if handled, or 0 if this is an external command.
+ */
+static int handle_builtin(int argc, char *argv[])
+{
+    if (strcmp(argv[0], "exit") == 0) {
+        /* This version supports exit without arguments. */
+        if (argc != 1) {
+            fprintf(stderr, "Usage: exit\n");
+            return 1;
+        }
+
+        exit(EXIT_SUCCESS);
+    }
+
+    if (strcmp(argv[0], "cd") == 0) {
+        if (argc > 2) {
+            fprintf(stderr, "Usage: cd [directory]\n");
+            return 1;
+        }
+
+        /* With no argument, cd uses the user's home directory. */
+        const char *directory;
+
+        if (argc == 1) {
+            directory = getenv("HOME");
+
+            if (directory == NULL || directory[0] == '\0') {
+                fprintf(stderr, "cd: HOME is not set\n");
+                return 1;
+            }
+        } else {
+            directory = argv[1];
+        }
+
+        /* Change this shell's current working directory. */
+        if (chdir(directory) == -1) {
+            perror("cd");
+        }
+
+        return 1;
+    }
+
+    return 0;
+}
+
 int main(void)
 {
     char input[INPUT_SIZE];
@@ -153,9 +200,9 @@ int main(void)
 	    continue;
 	}
 
-	/* Execute only when parsing produced a command. */
-	if (argc > 0) {
-		execute_command(argv);
+	/* Built-ins run in the parent; external programs run in children. */
+	if (argc > 0 && !handle_builtin(argc, argv)) {
+    		execute_command(argv);
 	}
     }
 
