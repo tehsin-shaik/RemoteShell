@@ -5,6 +5,34 @@
 /* Maximum input length is 1023 characters plus the null terminator. */
 #define INPUT_SIZE 1024
 
+#define MAX_ARGS 64
+
+/*
+ * Split input in place into whitespace-separated arguments.
+ * argv points into input, so no memory allocation is needed.
+ * Returns the argument count, or -1 if there are too many.
+ */
+static int parse_command(char *input, char *argv[], size_t capacity)
+{
+    size_t count = 0;
+    char *token = strtok(input, " \t\r");
+
+    while (token != NULL) {
+        /* Reserve the final array entry for NULL. */
+        if (count >= capacity - 1) {
+            argv[count] = NULL;
+            return -1;
+        }
+
+        argv[count++] = token;
+        token = strtok(NULL, " \t\r");
+    }
+
+    /* Required by execvp when we add execution next. */
+    argv[count] = NULL;
+    return (int)count;
+}
+
 int main(void)
 {
     char input[INPUT_SIZE];
@@ -71,11 +99,21 @@ int main(void)
             continue;
         }
 
-        /*
-         * Temporary output to verify input handling.
-         * Parsing and command execution will replace this later.
-         */
-        printf("Received: %s\n", input);
+	/* Allow MAX_ARGS arguments plus the terminating NULL pointer. */
+	char *argv[MAX_ARGS + 1];
+
+	int argc = parse_command(input, argv, MAX_ARGS + 1);
+
+	if (argc == -1) {
+	    fprintf(stderr, "RemoteShell: too many arguments (maximum %d)\n",
+	            MAX_ARGS);
+	    continue;
+	}
+
+	/* Temporary output: verify parsing before executing commands. */
+	for (int i = 0; i < argc; i++) {
+	    printf("argv[%d] = \"%s\"\n", i, argv[i]);
+	}
     }
 
     return EXIT_SUCCESS;
