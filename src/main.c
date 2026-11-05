@@ -12,6 +12,7 @@
 #define INPUT_SIZE 1024
 
 #define MAX_ARGS 64
+#define MAX_COMMANDS 4
 
 /*
  * Split input in place into whitespace-separated arguments.
@@ -126,81 +127,63 @@ static int handle_builtin(int argc, char *argv[])
 }
 
 /*
- * Execute two external commands connected by one pipe.
- * left and right are NULL-terminated argument arrays.
+ * Split a line into commands, then parse each command's arguments.
+ * Return the command count, or -1 for invalid input.
+ * Quotes and escapes are still unsupported.
  */
-static void execute_pipeline(char *left[], char *right[])
+static int parse_pipeline(char *input,
+                          char *commands[][MAX_ARGS + 1],
+                          int arg_counts[])
 {
-    int fd[2];
-    pid_t children[2];
+    int count = 0;
 
-    if (pipe(fd) == -1) {
-        perror("pipe");
-        return;
-    }
-
-    /* Start BOTH children before waiting: pipes have limited capacity. */
-    for (int i = 0; i < 2; i++) {
-        children[i] = fork();
-
-        if (children[i] == -1) {
-            perror("fork");
-            close(fd[0]);
-            close(fd[1]);
-
-            /* If the second fork failed, stop and reap the first child. */
-            if (i == 1) {
-                if (kill(children[0], SIGKILL) == -1 && errno != ESRCH)
-                    perror("kill");
-
-                while (waitpid(children[0], NULL, 0) == -1) {
-                    if (errno != EINTR) {
-                        perror("waitpid");
-                        break;
-                    }
-                }
-            }
-
-            return;
+    for (;;) {
+        if (count == MAX_COMMANDS) {
+            fprintf(stderr, "RemoteShell: maximum 3 pipes supported\n");
+            return -1;
         }
 
-        if (children[i] == 0) {
-            /*
-             * First command: stdout -> pipe write end.
-             * Second command: stdin <- pipe read end.
-             */
-            int source = (i == 0) ? fd[1] : fd[0];
-            int target = (i == 0) ? STDOUT_FILENO : STDIN_FILENO;
+        /* Split at the next pipe, preserving empty stages for validation. */
+        char *separator = strchr(input, '|');
 
-            if (dup2(source, target) == -1) {
-                perror("dup2");
-                _exit(EXIT_FAILURE);
-            }
+        if (separator != NULL)
+            *separator = '\0';
 
-            /* Close original descriptors; keep the redirected standard FD. */
-            if (fd[0] != target)
-                close(fd[0]);
-            if (fd[1] != target)
-                close(fd[1]);
+        int argc = parse_command(input, commands[count], MAX_ARGS + 1);
 
-            char **args = (i == 0) ? left : right;
-            execvp(args[0], args);
-
-            int saved_errno = errno;
-            perror(args[0]);
-            _exit(saved_errno == ENOENT ? 127 : 126);
+        if (argc < 0) {
+            fprintf(stderr, "RemoteShell: too many arguments\n");
+            return -1;
         }
+
+        if (argc == 0) {
+            fprintf(stderr, "RemoteShell: missing command beside pipe\n");
+            return -1;
+        }
+
+        arg_counts[count++] = argc;
+
+        if (separator == NULL)
+            return count;
+
+        /* Continue with the text after this pipe. */
+        input = separator + 1;
     }
+}
 
-    /*
-     * The shell does not read or write pipeline data.
-     * Closing its copies lets readers receive EOF when writers finish.
-     */
-    close(fd[0]);
-    close(fd[1]);
+/* Close both ends of every successfully created pipe. */
+static void close_pipes(int pipes[][2], int count)
+{
+    for (int i = 0; i < count; i++) {
+        close(pipes[i][0]);
+        close(pipes[i][1]);
+    }
+}
 
-    /* Reap both children, even if one command failed. */
-    for (int i = 0; i < 2; i++) {
+/* Reap every child, retrying waits interrupted by signals. */
+static void wait_for_children(pid_t children[], int count)
+{
+    for (int i = 0; i < count; i++) {
         while (waitpid(children[i], NULL, 0) == -1) {
             if (errno != EINTR) {
                 perror("waitpid");
@@ -208,6 +191,80 @@ static void execute_pipeline(char *left[], char *right[])
             }
         }
     }
+}
+
+/*
+ * Run two to four external commands.
+ * Command i reads from pipe i-1 and writes to pipe i,
+ * except at the first and last stages.
+ */
+static void execute_pipeline(char *commands[][MAX_ARGS + 1], int count)
+{
+    int pipes[MAX_COMMANDS - 1][2];
+    pid_t children[MAX_COMMANDS];
+    int pipe_count = count - 1;
+
+    /* Create all pipes before starting children. */
+    for (int i = 0; i < pipe_count; i++) {
+        if (pipe(pipes[i]) == -1) {
+            perror("pipe");
+
+            /* Only the first i pipes were successfully created. */
+            close_pipes(pipes, i);
+            return;
+        }
+    }
+
+    /* Start every command before waiting for any command. */
+    for (int i = 0; i < count; i++) {
+        children[i] = fork();
+
+        if (children[i] == -1) {
+            perror("fork");
+            close_pipes(pipes, pipe_count);
+
+            /* Stop any children already started after partial failure. */
+            for (int j = 0; j < i; j++) {
+                if (kill(children[j], SIGKILL) == -1 && errno != ESRCH)
+                    perror("kill");
+            }
+
+            wait_for_children(children, i);
+            return;
+        }
+
+        if (children[i] == 0) {
+            /* Every command except the first reads the previous pipe. */
+            if (i > 0 &&
+                dup2(pipes[i - 1][0], STDIN_FILENO) == -1) {
+                perror("dup2 stdin");
+                _exit(EXIT_FAILURE);
+            }
+
+            /* Every command except the last writes to the next pipe. */
+            if (i < count - 1 &&
+                dup2(pipes[i][1], STDOUT_FILENO) == -1) {
+                perror("dup2 stdout");
+                _exit(EXIT_FAILURE);
+            }
+
+            /*
+             * Redirected stdin/stdout remain open after these originals
+             * close. Unused copies must close so EOF works correctly.
+             */
+            close_pipes(pipes, pipe_count);
+
+            execvp(commands[i][0], commands[i]);
+
+            int saved_errno = errno;
+            perror(commands[i][0]);
+            _exit(saved_errno == ENOENT ? 127 : 126);
+        }
+    }
+
+    /* The parent owns no pipeline data connections while waiting. */
+    close_pipes(pipes, pipe_count);
+    wait_for_children(children, count);
 }
 
 int main(void)
@@ -275,70 +332,42 @@ int main(void)
         if (input[strspn(input, " \t\r")] == '\0') {
             continue;
         }
-        
-        /* Detect a pipeline before strtok modifies the input. */
-        char *separator = strchr(input, '|');
 
-        if (separator != NULL) {
-            /* This milestone supports exactly one pipe. */
-            if (strchr(separator + 1, '|') != NULL) {
-                fprintf(stderr,
-                        "RemoteShell: only one pipe is supported yet\n");
-                continue;
-            }
+        char *commands[MAX_COMMANDS][MAX_ARGS + 1];
+        int arg_counts[MAX_COMMANDS];
 
-            /* Split the input into two separate C strings. */
-            *separator = '\0';
+        /* Validate the whole line before executing anything. */
+        int count = parse_pipeline(input, commands, arg_counts);
 
-            char *left[MAX_ARGS + 1];
-            char *right[MAX_ARGS + 1];
+        if (count < 0)
+            continue;
 
-            /* Parse each side separately. */
-            int left_count = parse_command(input, left, MAX_ARGS + 1);
-            int right_count = parse_command(separator + 1, right,
-                                            MAX_ARGS + 1);
+        if (count == 1) {
+            /* Keep the existing single-command and built-in behavior. */
+            if (!handle_builtin(arg_counts[0], commands[0]))
+                execute_command(commands[0]);
 
-            if (left_count < 0 || right_count < 0) {
-                fprintf(stderr, "RemoteShell: too many arguments\n");
-                continue;
-            }
-
-            if (left_count == 0 || right_count == 0) {
-                fprintf(stderr,
-                        "RemoteShell: missing command beside pipe\n");
-                continue;
-            }
-
-            /* Reject built-ins inside pipelines for now. */
-            if (strcmp(left[0], "cd") == 0 ||
-                strcmp(left[0], "exit") == 0 ||
-                strcmp(right[0], "cd") == 0 ||
-                strcmp(right[0], "exit") == 0) {
-                fprintf(stderr,
-                        "RemoteShell: built-ins in pipelines are unsupported\n");
-                continue;
-            }
-
-            execute_pipeline(left, right);
             continue;
         }
 
-        /* Allow MAX_ARGS arguments plus the terminating NULL pointer. */
-        char *argv[MAX_ARGS + 1];
+        /* Built-ins in pipelines remain unsupported. */
+        int contains_builtin = 0;
 
-        int argc = parse_command(input, argv, MAX_ARGS + 1);
+        for (int i = 0; i < count; i++) {
+            if (strcmp(commands[i][0], "cd") == 0 ||
+                strcmp(commands[i][0], "exit") == 0) {
+                contains_builtin = 1;
+                break;
+            }
+        }
 
-        if (argc == -1) {
+        if (contains_builtin) {
             fprintf(stderr,
-                    "RemoteShell: too many arguments (maximum %d)\n",
-                    MAX_ARGS);
+                    "RemoteShell: built-ins in pipelines are unsupported\n");
             continue;
         }
 
-        /* Built-ins run in the parent; external commands run in children. */
-        if (argc > 0 && !handle_builtin(argc, argv)) {
-            execute_command(argv);
-        }
+        execute_pipeline(commands, count);
     }
 
     return EXIT_SUCCESS;
