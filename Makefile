@@ -3,13 +3,17 @@ CFLAGS = -std=c11 -Wall -Wextra -Wpedantic -g
 
 .PHONY: all clean
 
-# Default target: build the shell.
-all: remoteshell
+all: remoteshell server client
 
-# Rebuild when the source file changes.
-remoteshell: src/main.c
-	$(CC) $(CFLAGS) src/main.c -o remoteshell
+remoteshell: src/main.c src/shell.c src/shell.h
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) src/main.c src/shell.c -o $@ $(LDLIBS)
 
-# Remove the generated executable.
+server: src/server.c src/shell.c src/net.c src/shell.h src/net.h
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) src/server.c src/shell.c src/net.c -o $@ $(LDLIBS)
+
+client: src/client.c src/net.c src/net.h src/shell.h
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) src/client.c src/net.c -o $@ $(LDLIBS)
+
 clean:
-	rm -f remoteshell
+	rm -f remoteshell server client
+
