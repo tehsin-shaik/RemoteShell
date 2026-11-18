@@ -8,6 +8,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 #include <signal.h>
+#include <sys/prctl.h>
 
 #include "shell.h"
 
@@ -45,50 +46,8 @@ static int parse_command(char *input, char *argv[], size_t capacity)
     return (int)count;
 }
 
-/*
- * Execute one external program in a child process.
- * The calling process waits, then continues running the shell or server.
- */
-static void execute_command(char *argv[])
-{
-    pid_t pid = fork();
-
-    if (pid == -1) {
-        perror("fork");
-        return;
-    }
-
-    if (pid == 0) {
-        /*
-         * Replace the child with the requested program.
-         * Names without a slash are searched for using PATH.
-         */
-        execvp(argv[0], argv);
-
-        /* Successful execvp never returns; reaching here means failure. */
-        int saved_errno = errno;
-        perror(argv[0]);
-
-        /*
-         * End the child without flushing inherited stdio buffers.
-         * Use 127 for ENOENT and 126 for other execution failures.
-         */
-        _exit(saved_errno == ENOENT ? 127 : 126);
-    }
-
-    /* Wait for this child and collect its termination status. */
-    int status;
-
-    while (waitpid(pid, &status, 0) == -1) {
-        /* A signal may interrupt the wait; retry in that case. */
-        if (errno == EINTR) {
-            continue;
-        }
-
-        perror("waitpid");
-        return;
-    }
-}
+/* Single-command execution is implemented through the common executor below. */
+static void execute_command(char *argv[]);
 
 /*
  * Handle commands that must run in the calling shell process.
@@ -199,7 +158,7 @@ static int parse_pipeline(char *input,
     }
 }
 
-/* Close the read and write descriptors of each created pipe. */
+/* Close original pipe descriptors after redirection or setup failure. */
 static void close_pipes(int pipes[][2], int count)
 {
     for (int i = 0; i < count; i++) {
@@ -208,104 +167,184 @@ static void close_pipes(int pipes[][2], int count)
     }
 }
 
-/*
- * Wait for each listed child to finish.
- * Passing NULL discards the status value while still completing
- * child-process cleanup. Interrupted waits are retried.
- */
+static struct shell_job_hooks job_hooks;
+
+void shell_set_job_hooks(const struct shell_job_hooks *hooks)
+{
+    if (hooks != NULL)
+        job_hooks = *hooks;
+    else
+        memset(&job_hooks, 0, sizeof(job_hooks));
+}
+
+static int observe_child(pid_t child, int options, siginfo_t *information)
+{
+    for (;;) {
+        if (waitid(P_PID, (id_t)child, information, options) == 0)
+            return 0;
+        if (errno != EINTR)
+            return -1;
+    }
+}
+
+/* Release every child process entry, retrying interrupted waits. */
 static void wait_for_children(pid_t children[], int count)
 {
     for (int i = 0; i < count; i++) {
         while (waitpid(children[i], NULL, 0) == -1) {
-            if (errno != EINTR) {
+            if (errno == EINTR)
+                continue;
+            if (errno != ECHILD)
                 perror("waitpid");
-                break;
-            }
+            break;
         }
     }
 }
 
+/* Also signal individual children if group setup was only partially finished. */
+static void terminate_children(pid_t children[], int count, pid_t pgid)
+{
+    if (pgid > 1 && kill(-pgid, SIGKILL) == -1 && errno != ESRCH)
+        perror("terminate command group");
+    for (int i = 0; i < count; i++) {
+        if (kill(children[i], SIGKILL) == -1 && errno != ESRCH)
+            perror("terminate command child");
+    }
+    wait_for_children(children, count);
+}
+
 /*
- * Execute two to four commands connected by pipes.
- * Each command runs in its own child process.
- *
- * Command i:
- *   Reads from pipe i-1, unless it is the first command.
- *   Writes to pipe i, unless it is the last command.
+ * Common executor for one external command or a pipeline of up to four stages.
+ * In scheduled workers, all stages join one new process group and stop BEFORE
+ * exec. The ready hook admits the group only after all stages are confirmed
+ * stopped, so no command runs ahead of its first turn.
  */
 static void execute_pipeline(char *commands[][MAX_ARGS + 1], int count)
 {
     int pipes[MAX_COMMANDS - 1][2];
     pid_t children[MAX_COMMANDS];
     int pipe_count = count - 1;
+    int scheduled = job_hooks.ready != NULL && job_hooks.finished != NULL;
+    pid_t pgid = 0;
+    pid_t owner = getpid();
 
-    /* N commands need N-1 pipes. Create them before starting children. */
     for (int i = 0; i < pipe_count; i++) {
         if (pipe(pipes[i]) == -1) {
             perror("pipe");
-
-            /* Close only the pipes successfully created before this failure. */
             close_pipes(pipes, i);
             return;
         }
     }
 
-    /*
-     * Launch every command before waiting.
-     * Producers and consumers must run together because pipes have
-     * limited capacity.
-     */
     for (int i = 0; i < count; i++) {
         children[i] = fork();
-
         if (children[i] == -1) {
             perror("fork");
             close_pipes(pipes, pipe_count);
-
-            /* Cancel the commands already started for this incomplete setup. */
-            for (int j = 0; j < i; j++) {
-                if (kill(children[j], SIGKILL) == -1 && errno != ESRCH)
-                    perror("kill");
-            }
-
-            wait_for_children(children, i);
+            terminate_children(children, i, pgid);
             return;
         }
 
         if (children[i] == 0) {
-            /* Read the preceding command's output through standard input. */
-            if (i > 0 &&
-                dup2(pipes[i - 1][0], STDIN_FILENO) == -1) {
+            if (scheduled) {
+                /* A stopped stage must not outlive an unexpectedly lost worker. */
+                if (prctl(PR_SET_PDEATHSIG, (unsigned long)SIGKILL,
+                          0UL, 0UL, 0UL) == -1) {
+                    perror("command parent-death protection");
+                    _exit(EXIT_FAILURE);
+                }
+                if (getppid() != owner)
+                    _exit(EXIT_FAILURE);
+                close(job_hooks.control_fd);
+            }
+            /* The first child creates the group; later stages join it. */
+            if (scheduled && setpgid(0, pgid) == -1) {
+                perror("child setpgid");
+                _exit(EXIT_FAILURE);
+            }
+            if (i > 0 && dup2(pipes[i - 1][0], STDIN_FILENO) == -1) {
                 perror("dup2 stdin");
                 _exit(EXIT_FAILURE);
             }
-
-            /* Send standard output to the following command. */
-            if (i < count - 1 &&
-                dup2(pipes[i][1], STDOUT_FILENO) == -1) {
+            if (i < count - 1 && dup2(pipes[i][1], STDOUT_FILENO) == -1) {
                 perror("dup2 stdout");
                 _exit(EXIT_FAILURE);
             }
-
-            /*
-             * stdin/stdout retain the redirected connections.
-             * Close all original pipe descriptors, including unused copies,
-             * so readers can detect EOF when the writers finish.
-             */
             close_pipes(pipes, pipe_count);
 
-            execvp(commands[i][0], commands[i]);
+            if (scheduled && raise(SIGSTOP) != 0)
+                _exit(EXIT_FAILURE);
 
-            /* Report execution failure and terminate only this child. */
+            execvp(commands[i][0], commands[i]);
             int saved_errno = errno;
             perror(commands[i][0]);
             _exit(saved_errno == ENOENT ? 127 : 126);
         }
+
+        if (scheduled) {
+            if (pgid == 0)
+                pgid = children[i];
+            /* Parent and child both set the group to avoid a startup race. */
+            if (setpgid(children[i], pgid) == -1) {
+                perror("parent setpgid");
+                close_pipes(pipes, pipe_count);
+                terminate_children(children, i + 1, pgid);
+                return;
+            }
+        }
+    }
+    close_pipes(pipes, pipe_count);
+
+    if (scheduled) {
+        for (int i = 0; i < count; i++) {
+            siginfo_t information;
+            if (observe_child(children[i], WSTOPPED | WEXITED | WNOWAIT,
+                              &information) == -1 ||
+                information.si_code != CLD_STOPPED) {
+                fputs("shell: command setup failed before scheduling\n", stderr);
+                terminate_children(children, count, pgid);
+                return;
+            }
+        }
+
+        if (job_hooks.ready(job_hooks.context, pgid) == -1) {
+            perror("scheduler ready handshake");
+            terminate_children(children, count, pgid);
+            return;
+        }
+
+        /*
+         * Observe completion without releasing PIDs. The group identity stays
+         * reserved until the server removes it from the scheduler and ACKs.
+         */
+        for (int i = 0; i < count; i++) {
+            siginfo_t information;
+            if (observe_child(children[i], WEXITED | WNOWAIT,
+                              &information) == -1) {
+                perror("observe command exit");
+                terminate_children(children, count, pgid);
+                return;
+            }
+        }
+
+        if (job_hooks.finished(job_hooks.context, pgid) == -1) {
+            perror("scheduler completion handshake");
+            terminate_children(children, count, pgid);
+            return;
+        }
     }
 
-    /* The parent does not transfer pipe data; close its copies before waiting. */
-    close_pipes(pipes, pipe_count);
     wait_for_children(children, count);
+}
+
+static void execute_command(char *argv[])
+{
+    char *commands[1][MAX_ARGS + 1];
+    size_t i = 0;
+    do {
+        commands[0][i] = argv[i];
+    } while (argv[i++] != NULL);
+    execute_pipeline(commands, 1);
 }
 
 /*

@@ -1,5 +1,9 @@
-# Compiled executable
+# Compiled executables
 /remoteshell
+/server
+/client
+/server_worker
+/cpu_job
 
 # Compiled object files
 *.o

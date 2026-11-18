@@ -7,6 +7,14 @@
 /* TCP port used when no port argument is provided. */
 #define DEFAULT_PORT 5555
 
+/* Private socket descriptor installed in each spawned shell worker. */
+#define WORKER_CHANNEL_FD 3
+
+/* Private worker events; these values never appear as client output lengths. */
+#define WORKER_JOB_READY UINT32_MAX
+#define WORKER_JOB_DONE (UINT32_MAX - 1U)
+#define WORKER_EVENT_ACK 1U
+
 /* Maximum number of output bytes sent in one response chunk. */
 #define OUTPUT_CHUNK_SIZE 4096
 
